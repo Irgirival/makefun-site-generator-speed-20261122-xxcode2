@@ -64,20 +64,44 @@ let slugCache = new Map();
 function slugify(text) {
   const hit = slugCache.get(text);
   if (hit !== undefined) return hit;
-  const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
+  // ASCII fast path: NFKD is the identity on ASCII and there are no
+  // combining marks to drop, so the indexed loop below is exactly the
+  // general one, without the normalize and the mark-stripping regex. A
+  // non-ASCII character bails out to the general path, discarding the
+  // partial output built so far.
   let out = '';
   let gap = false;
-  for (const ch of plain) {
-    let keep = null;
-    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-    if (keep === null) {
+  let ascii = true;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c > 127) { ascii = false; break; }
+    let keep = -1;
+    if (c >= 65 && c <= 90) keep = c + 32;
+    else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) keep = c;
+    if (keep === -1) {
       gap = out.length > 0;
       continue;
     }
     if (gap) out += '-';
     gap = false;
-    out += keep;
+    out += String.fromCharCode(keep);
+  }
+  if (!ascii) {
+    out = '';
+    gap = false;
+    const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
+    for (const ch of plain) {
+      let keep = null;
+      if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
+      else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
+      if (keep === null) {
+        gap = out.length > 0;
+        continue;
+      }
+      if (gap) out += '-';
+      gap = false;
+      out += keep;
+    }
   }
   out = out.slice(0, SLUG_MAX).replace(/-+$/, '');
   const slug = out === '' ? 'untitled' : out;
@@ -130,6 +154,11 @@ function wordsOf(text) {
 
 /** `rel` (a link's path, "/"-separated) from the directory `dir` of a source, or null when it climbs out of the root. */
 function resolvePath(dir, rel) {
+  // The common case: no "..", "." or empty segments and no trailing "/",
+  // so the resolved path is the directory and the relative path joined.
+  if (rel.indexOf('..') === -1 && rel.indexOf('./') === -1 && rel.indexOf('//') === -1 && !rel.endsWith('/.') && !rel.endsWith('/') && rel !== '.') {
+    return dir === '' ? rel : `${dir}/${rel}`;
+  }
   const parts = dir === '' ? [] : dir.split('/');
   for (const seg of rel.split('/')) {
     if (seg === '' || seg === '.') continue;
@@ -363,8 +392,8 @@ function headingOf(line) {
 function isHr(line) {
   let end = line.length;
   while (end > 0 && (line.charCodeAt(end - 1) === 32 || line.charCodeAt(end - 1) === 9)) end--;
-  const t = line.slice(0, end);
-  return t === '---' || t === '***';
+  // The line with trailing spaces and tabs stripped is "---" or "***".
+  return end === 3 && ((line.charCodeAt(0) === 45 && line.charCodeAt(1) === 45 && line.charCodeAt(2) === 45) || (line.charCodeAt(0) === 42 && line.charCodeAt(1) === 42 && line.charCodeAt(2) === 42));
 }
 
 /** A bullet item's text, or null; an ordered item's text and start, or null. */
@@ -389,7 +418,8 @@ function isContinued(line) {
   let j = 0;
   while (j < line.length && line.charCodeAt(j) === 32) j++;
   if (j < 2 || j >= line.length) return false;
-  return !/\s/.test(line[j]);
+  const c = line.charCodeAt(j);
+  return !(c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13 || c === 160 || c === 5760 || (c >= 8192 && c <= 8202) || c === 8232 || c === 8233 || c === 8239 || c === 8287 || c === 12288 || c === 65279);
 }
 
 /** The characters a backslash escapes. */
@@ -446,8 +476,14 @@ function pushEscaped(out, str) {
  * matches the reference's inline renderer exactly: backslash escapes, code
  * spans, strong, emphasis, and links with their unescaped closers.
  */
+/** The inline specials, one shared regex: inlineInto is recursive, and
+ * every call site that recurses sets lastIndex explicitly afterwards, so
+ * sharing is safe (entry resets it to 0). */
+const INLINE_RE = /[\\`*\[&<>"']/g;
+
 function inlineInto(s, env, out) {
-  const re = /[\\`*\[&<>"']/g;
+  const re = INLINE_RE;
+  re.lastIndex = 0;
   let plain = 0;
   let m;
   while ((m = re.exec(s)) !== null) {
@@ -573,7 +609,9 @@ function renderMarkdown(src, env) {
         i++;
         const cls = fence === '' ? '' : ` class="language-${escapeHtml(fence)}"`;
         out.push(`<pre><code${cls}>`);
-        for (const l of body) out.push(escapeHtml(l), '\n');
+        // One escape over the joined body: escaping never touches "\n",
+        // so this is exactly escaping each line and pushing a "\n" after it.
+        if (body.length > 0) out.push(escapeHtml(body.join('\n')), '\n');
         out.push('</code></pre>\n');
         continue;
       }
@@ -877,23 +915,123 @@ function getProp(obj, key) {
  * the reference's object literal does). Anything else reads from R, so a
  * name no loop binds is the root value or undefined.
  */
+/** The root values every render has. */
+const ROOT_KEYS = new Set(['site', 'tags', 'recent', 'page', 'posts', 'pager', 'tag']);
+/** Own keys of each value kind, for the compiler's direct reads below. */
+const SITE_KEYS = new Set(['title', 'base_url']);
+const LOOP_KEYS = new Set(['index', 'first', 'last', 'length']);
+const CARD_KEYS = new Set(['title', 'url', 'date', 'date_long', 'summary', 'excerpt', 'reading_minutes', 'tags']);
+const TAGREF_KEYS = new Set(['name', 'slug', 'url']);
+const ALLTAG_KEYS = new Set(['name', 'slug', 'url', 'count']);
+const TOC_KEYS = new Set(['level', 'id', 'html']);
+const PAGE_KEYS = new Set(['title', 'url', 'date', 'date_long', 'summary', 'excerpt', 'reading_minutes', 'tags', 'slug', 'content', 'toc', 'newer', 'older', 'is_post']);
+const TAG_KEYS = new Set(['name', 'slug', 'url', 'count', 'posts']);
+const PAGER_KEYS = new Set(['number', 'total', 'url', 'newer_url', 'older_url']);
+/** A value kind's own keys, or undefined for an array kind (only `length` is its own). */
+const KEYS_OF = { site: SITE_KEYS, loop: LOOP_KEYS, card: CARD_KEYS, tagref: TAGREF_KEYS, alltag: ALLTAG_KEYS, toc: TOC_KEYS, page: PAGE_KEYS, tag: TAG_KEYS, pager: PAGER_KEYS };
+
+/** The kind of the array a member of `type` names, or null when it names no known array. */
+function memberType(type, key) {
+  if (type === 'card' && key === 'tags') return 'arr-tagref';
+  if (type === 'page' && key === 'tags') return 'arr-tagref';
+  if (type === 'page' && key === 'toc') return 'arr-toc';
+  if ((type === 'tag' || type === 'alltag') && key === 'posts') return 'arr-card';
+  return null;
+}
+
+/**
+ * The element kind of the array a `for` iterates, from the path alone, or
+ * null when it is not a known array: posts/recent/tag.posts hold cards,
+ * page.tags holds tag references, tags holds tag list items, page.toc holds
+ * table-of-contents items. `stack` holds the loop elements in scope, so a
+ * path starting at one of them resolves through its kind.
+ */
+function elemTypeOf(path, stack) {
+  let type = null;
+  const first = path[0];
+  if (first === 'loop') return null;
+  for (let i = stack.length - 1; i >= 0; i--) {
+    if (stack[i].elemName === first) { type = stack[i].elemType; break; }
+  }
+  if (type === null) {
+    if (first === 'site') type = 'site';
+    else if (first === 'page') type = 'page';
+    else if (first === 'tag') type = 'tag';
+    else if (first === 'pager') type = 'pager';
+    else if (first === 'posts' || first === 'recent') type = 'arr-card';
+    else if (first === 'tags') type = 'arr-alltag';
+    else return null;
+  }
+  for (let k = 1; k < path.length; k++) {
+    type = memberType(type, path[k]);
+    if (type === null) return null;
+  }
+  if (type === 'arr-card') return 'card';
+  if (type === 'arr-tagref') return 'tagref';
+  if (type === 'arr-alltag') return 'alltag';
+  if (type === 'arr-toc') return 'toc';
+  return null;
+}
+
 function genPath(path, stack) {
   const first = path[0];
   let expr;
+  let type;
+  let nullable;
   if (first === 'loop') {
     if (stack.length === 0) return 'undefined';
     expr = stack[stack.length - 1].loopVar;
+    type = 'loop';
+    nullable = false;
   } else {
     let bound = null;
     for (let i = stack.length - 1; i >= 0; i--) {
       if (stack[i].elemName === first) {
-        bound = stack[i].elemVar;
+        bound = stack[i];
         break;
       }
     }
-    expr = bound !== null ? bound : `get(R, ${JSON.stringify(first)})`;
+    if (bound !== null) {
+      expr = bound.elemVar;
+      type = bound.elemType;
+      nullable = false;
+    } else if (ROOT_KEYS.has(first)) {
+      // Reading a property of R never throws; the value itself may be
+      // undefined for a render that does not set it, exactly as getProp
+      // would read it.
+      expr = `R.${first}`;
+      if (first === 'site') { type = 'site'; nullable = false; }
+      else if (first === 'page') { type = 'page'; nullable = true; }
+      else if (first === 'tag') { type = 'tag'; nullable = true; }
+      else if (first === 'pager') { type = 'pager'; nullable = true; }
+      else if (first === 'posts' || first === 'recent') { type = 'arr-card'; nullable = true; }
+      else { type = 'arr-alltag'; nullable = true; }
+    } else {
+      expr = `get(R, ${JSON.stringify(first)})`;
+      type = null;
+      nullable = true;
+    }
   }
-  for (let k = 1; k < path.length; k++) expr = `get(${expr}, ${JSON.stringify(path[k])})`;
+  for (let k = 1; k < path.length; k++) {
+    const key = path[k];
+    const keys = type === null ? null : KEYS_OF[type];
+    if (!nullable && keys !== undefined && keys !== null && keys.has(key)) {
+      // A proven own key of an object that cannot be null: direct read,
+      // the same value getProp would return (getProp only differs from a
+      // direct read for inherited names, and none of these is one).
+      expr = `${expr}.${key}`;
+      type = memberType(type, key);
+      nullable = false;
+    } else if (!nullable && type !== null && type.startsWith('arr-') && key === 'length') {
+      expr = `${expr}.length`;
+      type = null;
+      nullable = false;
+    } else {
+      expr = `get(${expr}, ${JSON.stringify(key)})`;
+      type = null;
+      nullable = true;
+    }
+  }
   return expr;
 }
 
@@ -919,7 +1057,7 @@ function genNodes(nodes, depth, stack, S) {
       code += `for (let ${idxVar} = 0; ${idxVar} < ${arrVar}.length; ${idxVar}++) {\n`;
       code += `const ${elemVar} = ${arrVar}[${idxVar}];\n`;
       code += `${loopVar}.index = ${idxVar} + 1; ${loopVar}.first = ${idxVar} === 0; ${loopVar}.last = ${idxVar} === ${arrVar}.length - 1;\n`;
-      stack.push({ elemName: n.name, elemVar, loopVar });
+      stack.push({ elemName: n.name, elemVar, loopVar, elemType: elemTypeOf(n.path, stack) });
       code += genNodes(n.body, depth, stack, S);
       stack.pop();
       code += '}\n}\n}\n';
@@ -1073,7 +1211,11 @@ export function build(input) {
       const dir = dirOf(s.path);
       const env = {
         link: (target) => {
-          if (SCHEME_RE.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
+          // Absolute and fragment targets pass through; a scheme needs a
+          // leading letter, so the regex only runs for those.
+          const c0 = target.charCodeAt(0);
+          if (c0 === 47 || c0 === 35) return target;
+          if (((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122)) && SCHEME_RE.test(target)) return target;
           const key = `${dir}\n${target}`;
           const hit = linkCache.get(key);
           if (hit !== undefined) {
@@ -1182,10 +1324,17 @@ export function build(input) {
     for (const s of b.sources) {
       const base = s.post ? b.cards.get(s) : cardOf(s);
       const page = {
-        ...base,
+        title: base.title,
+        url: base.url,
+        date: base.date,
+        date_long: base.date_long,
+        summary: base.summary,
+        excerpt: base.excerpt,
+        reading_minutes: base.reading_minutes,
+        tags: base.tags,
         slug: s.slug,
         content: s.html,
-        toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+        toc: s.toc,
         newer: linkOf(s.newer ?? null),
         older: linkOf(s.older ?? null),
         is_post: s.post,
