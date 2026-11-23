@@ -1035,10 +1035,129 @@ function genPath(path, stack) {
   return expr;
 }
 
+// ---------------------------------------------------------------- pure-template fragments
+
+/** The least estimated work that makes a fragment worth caching. */
+const FRAG_MIN_WORK = 12;
+
+/**
+ * Whether the path `path` can be read by a fragment function that receives
+ * only R: its root is site, tags or recent, or a name bound by a loop
+ * inside the fragment. `stack` holds the enclosing loops as { name,
+ * internal } (internal = bound by a loop inside the fragment being tested).
+ * A path through `loop` reads the innermost loop's record, so it is
+ * readable exactly when that loop is inside the fragment (or there is no
+ * loop at all, when it reads as undefined).
+ */
+function pathOK(path, stack) {
+  const first = path[0];
+  if (first === 'loop') {
+    if (stack.length === 0) return true;
+    return stack[stack.length - 1].internal;
+  }
+  for (let i = stack.length - 1; i >= 0; i--) {
+    if (stack[i].name === first) return stack[i].internal;
+  }
+  return first === 'site' || first === 'tags' || first === 'recent';
+}
+
+/**
+ * Whether the node list `nodes` can be rendered by a fragment function
+ * receiving only R: its output then depends only on the case's site, tags
+ * and recent, which never change between renders of a case. `stack` holds
+ * the enclosing loops; `depth` is the include depth.
+ */
+function fragOK(nodes, stack, depth, templates) {
+  for (const n of nodes) {
+    if (n.kind === 'text') continue;
+    if (n.kind === 'var' || n.kind === 'raw') {
+      if (!pathOK(n.path, stack)) return false;
+    } else if (n.kind === 'if') {
+      if (!pathOK(n.path, stack)) return false;
+      if (!fragOK(n.then, stack, depth, templates)) return false;
+      if (n.else !== null && !fragOK(n.else, stack, depth, templates)) return false;
+    } else if (n.kind === 'for') {
+      if (!pathOK(n.path, stack)) return false;
+      if (!fragOK(n.body, [...stack, { name: n.name, internal: true }], depth, templates)) return false;
+    } else if (n.kind === 'include') {
+      if (depth >= INCLUDE_DEPTH) continue;
+      const target = templates.get(n.name);
+      if (target !== undefined && !fragOK(target, stack, depth + 1, templates)) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The estimated work of rendering `nodes` once: a text push counts 1, a
+ * variable 4, an if 3 plus its branches, a loop 8 plus ten times its body
+ * (tags run long, recent short; ten is the middle), an include its target.
+ */
+function fragWork(nodes, stack, depth, templates) {
+  let w = 0;
+  for (const n of nodes) {
+    if (n.kind === 'text') w += 1;
+    else if (n.kind === 'var' || n.kind === 'raw') w += 4;
+    else if (n.kind === 'if') {
+      w += 3 + fragWork(n.then, stack, depth, templates) + (n.else === null ? 0 : fragWork(n.else, stack, depth, templates));
+    } else if (n.kind === 'for') {
+      w += 8 + 10 * fragWork(n.body, [...stack, { name: n.name, internal: true }], depth, templates);
+    } else if (n.kind === 'include') {
+      if (depth < INCLUDE_DEPTH) {
+        const target = templates.get(n.name);
+        if (target !== undefined) w += fragWork(target, stack, depth + 1, templates);
+      }
+    }
+  }
+  return w;
+}
+
+/**
+ * `nodes` compiled to code, with runs of fragment-safe nodes rendered once
+ * per case and cached: a run whose nodes read only site, tags and recent
+ * (never a page, posts, pager, tag, or a name bound by a loop outside the
+ * run) renders the same string on every render of the case, so the first
+ * render builds it and the rest push the cached string. Runs below
+ * FRAG_MIN_WORK stay inline: a fragment call costs more than the few
+ * pushes it would save. While a fragment body is being built (S.noFrag)
+ * no further fragment is taken, so a fragment never calls another.
+ */
 function genNodes(nodes, depth, stack, S) {
   let code = '';
-  for (const n of nodes) {
-    if (n.kind === 'text') code += `out.push(${JSON.stringify(n.text)});\n`;
+  if (!S.noFrag) {
+    const ext = stack.map((s) => ({ name: s.elemName, internal: false }));
+    let i = 0;
+    while (i < nodes.length) {
+      if (fragOK([nodes[i]], ext, depth, S.templates)) {
+        let j = i + 1;
+        while (j < nodes.length && fragOK([nodes[j]], ext, depth, S.templates)) j++;
+        const run = nodes.slice(i, j);
+        if (fragWork(run, ext, depth, S.templates) >= FRAG_MIN_WORK) {
+          const idx = S.frags.length;
+          const saved = S.noFrag;
+          S.noFrag = true;
+          const fragBody = genNodes(run, depth, stack, S);
+          S.noFrag = saved;
+          S.frags.push(fragBody);
+          const u = S.uid++;
+          code += `{ let _s${u} = fc[${idx}]; if (_s${u} === undefined) { const _o${u} = []; ff[${idx}](R, _o${u}, esc, textOf, truthy, get); _s${u} = fc[${idx}] = _o${u}.join(''); } out.push(_s${u}); }\n`;
+          i = j;
+          continue;
+        }
+      }
+      code += genNode(nodes[i], depth, stack, S);
+      i++;
+    }
+    return code;
+  }
+  for (const n of nodes) code += genNode(n, depth, stack, S);
+  return code;
+}
+
+/** One node compiled to code. */
+function genNode(n, depth, stack, S) {
+  let code = '';
+  if (n.kind === 'text') code += `out.push(${JSON.stringify(n.text)});\n`;
     else if (n.kind === 'var') code += `out.push(esc(textOf(${genPath(n.path, stack)})));\n`;
     else if (n.kind === 'raw') code += `out.push(textOf(${genPath(n.path, stack)}));\n`;
     else if (n.kind === 'if') {
@@ -1067,17 +1186,25 @@ function genNodes(nodes, depth, stack, S) {
         if (target !== undefined) code += genNodes(target, depth + 1, stack, S);
       }
     }
-  }
   return code;
 }
 
-/** The compiled render function for `name`'s template, or null when there is none. */
+/**
+ * The compiled render function for `name`'s template, with its pure
+ * fragments, or null when there is none: { fn, frags }. `fn` takes
+ * (R, out, esc, textOf, truthy, get, fc, ff): fc is the case's fragment
+ * cache for this template (one string slot per fragment, filled on first
+ * render) and ff the fragment render functions. Each fragment function
+ * takes (R, out, esc, textOf, truthy, get) and renders its fragment fresh.
+ */
 function compileTemplate(name, templates) {
   const nodes = templates.get(name);
   if (nodes === undefined) return null;
-  const S = { uid: 0, templates };
+  const S = { uid: 0, templates, frags: [], noFrag: false };
   const body = genNodes(nodes, 0, [], S);
-  return new Function('R', 'out', 'esc', 'textOf', 'truthy', 'get', body);
+  const fn = new Function('R', 'out', 'esc', 'textOf', 'truthy', 'get', 'fc', 'ff', body);
+  const frags = S.frags.map((fragBody) => new Function('R', 'out', 'esc', 'textOf', 'truthy', 'get', fragBody));
+  return { fn, frags };
 }
 
 // ---------------------------------------------------------------- the build
@@ -1303,18 +1430,23 @@ export function build(input) {
       baseVars.posts = vars.posts;
       baseVars.pager = vars.pager;
       baseVars.tag = vars.tag;
-      let fn = compiledCache.get(name);
-      if (fn === undefined) {
+      let entry = compiledCache.get(name);
+      if (entry === undefined) {
         try {
-          fn = compileTemplate(name, b.templates);
+          const c = compileTemplate(name, b.templates);
+          // The fragment cache is one array per template per case: site,
+          // tags and recent are built once per case and never change while
+          // step 7 renders, so a fragment's cached string stays right for
+          // every render of this case.
+          entry = c === null ? null : { fn: c.fn, frags: c.frags, fc: [] };
         } catch {
-          fn = null;
+          entry = null;
         }
-        compiledCache.set(name, fn);
+        compiledCache.set(name, entry);
       }
-      if (fn !== null) {
+      if (entry !== null) {
         const out = [];
-        fn(baseVars, out, escapeHtml, textOf, truthy, getProp);
+        entry.fn(baseVars, out, escapeHtml, textOf, truthy, getProp, entry.fc, entry.frags);
         return out.join('');
       }
       const out = [];
